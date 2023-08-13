@@ -1,0 +1,248 @@
+;;; UTF-8(BOMなし。BOM付きはNGです)
+;;;
+;;; FD-ARK (RaspberryPiPico firmware)
+;;; Copyright (c) 2023 Harumakkin.
+;;; SPDX-License-Identifier: MIT
+
+;----------------------------------------------------------------------------------
+; pio_fddreadは、FDDからのdata信号をサンプリングするためのステートマシンです。
+; 8MHzに設定されていますが、inとjmpの２ステートの繰り返しなので、
+; inは4MHz周期で実行されていることになります。
+; (data信号は4MHz周期でサンプリングされていることになります。）
+; この際、index信号の状態も同時にサンプリングして、data信号とセットで上位に渡しています。
+; 上位側ではindex信号を参照して、開始点と終点を判断しています。
+;
+.program pio_fddread
+loop1:
+    in	pins, 2		; index信号, data信号の2bitを同時に入力する
+    jmp loop1		; 先頭に戻る
+
+;----------------------------------------------------------------------------------
+; pio_fddwrite、FDDへのwrite信号を出力するためのステートマシンです。
+; 出力開始をindex信号状態から判断しています。
+; 上位は既定量のデータを出力すると最後にwrite-gate信号がHになるような
+; データをバッファに書き込み、ステートマシンを停止させる。
+.program pio_fddwrite
+	set pins, 3			; write-data信号, write-gate信号に H を出力する
+	wait 1 gpio 27		; index信号(gpio27)がHになるまで待つ
+	wait 0 gpio 27		; index信号(gpio27)がLになるまで待つ
+loop2:
+    out	pins, 2			; write-data信号, write-gate信号にバッファの2bitを出力する
+    jmp loop2			; 先頭に戻る
+
+;----------------------------------------------------------------------------------
+; pio_outputtofdc、FDCへreaddata信号を出力するためのステートマシンです。
+.program pio_outputtofdc
+.wrap_target
+    out	pins, 1		; read data信号を出力する
+	in	pins, 2		; write gate, write data信号を入力する
+.wrap				; wrap を使用して、jmpを省き、in/out２命令の4MHz信号を実現する
+
+
+;----------------------------------------------------------------------------------
+; pio_outputtofdc、FDCへreaddata信号を出力するためのステートマシンです。
+.program pio_output_read
+loop3:
+    out	pins, 1		; read data信号を出力する
+	jmp loop3
+.program pio_input_wgate
+loop4:
+    in	pins, 1		; write gate信号を入力する
+	jmp loop4
+.program pio_input_wdata
+loop5:
+    in	pins, 1		; write data信号を入力する
+	jmp loop5
+
+
+;----------------------------------------------------------------------------------
+; 参考）sm_config_set_clkdiv( &c, 15.625f ); の設定値
+; 1.0		// 125MHz
+; 4.0		// 31.25MHz
+; 7.8125	// 16M(実測では15Mhzだった、、）
+; 10.0		// 12.5MHz
+; 12.50		// 10M
+; 15.625	// 8MHz
+; 31.25		// 4MHz
+; 100.0		// 1.25MHz
+; 125.0		// 1M
+; 1000.0	// 125KHz
+; 10000.0	// 12.5KHz
+;			// (min 1.9kHz)
+;----------------------------------------------------------------------------------
+
+% c-sdk {
+static inline void pio_fddread_program_init(
+	PIO pio,
+	uint state_machine,
+	uint prog_addr,
+	uint start_gpio,
+	uint gpio_num)
+{
+	// 8MHz(プログラムは２サイクル消費しているので、サンプリングは4MHzになる）
+	static const float STATEMACHINE_CLOCK = 15.625;
+
+	pio_sm_config c = pio_fddread_program_get_default_config(prog_addr);
+
+	for (uint t = 0; t < gpio_num; ++t) {
+		pio_gpio_init( pio, start_gpio + t);
+		pio_sm_set_consecutive_pindirs(pio, state_machine, start_gpio + t, 1, false/*IN*/);
+	}
+
+	sm_config_set_in_pins(&c, start_gpio);
+	sm_config_set_in_shift(&c, false, true, 16);		// shift left, auto-push, threshold
+	// IN命令を実行すると、start_gpio+0のGPIOの値がbit0、start_gpio+1のGPIOの値がbit1 
+	// というようにマッピングされた"値"が生成され、
+	// ISRは指定ビット数分シフトして空いた領域に、この"値"が論理和される。
+	// ISRのシフト方向の設定と、"値"の構造（各ビットとGPIOの関係）は関係が無いことに注意する。
+	// 本プログラムでは、"値"の構造は、bit1=INDEX信号(At)、bit0=READDATA信号(Bt)となり、
+	// ISRには、最上位ビットから[A1][B1][A2][B2][A3][B3][A4][B4][A5][B5][A6][B6][A7][B7][A8][B8]
+	// という順番で格納される[At][Bt]がISRのLSB側から2ビット左シフトで空いた領域に論理和されて格納される。
+	// 疑似コード:
+	//		ISRCNT = 0;
+	//			:
+	//		GPIO_VAL = (At<<1) | Bt;
+	//		ISR <<= 2;
+	//  	ISR |= GPIO_VAL;
+	//		ISRCNT += 2;
+	//		if(ISRCNT == 16)
+	//			FIFO = ISR, ISR = 0, ISRCNT = 0;
+
+
+	pio_sm_clear_fifos(pio, state_machine);
+
+    sm_config_set_clkdiv( &c, STATEMACHINE_CLOCK );
+	
+	// Start
+	pio_sm_init(pio, state_machine, prog_addr, &c);
+	pio_sm_set_enabled(pio, state_machine, true);
+}
+
+static inline void pio_fddwrite_program_init(
+	PIO pio,
+	uint state_machine,
+	uint prog_addr,
+	uint start_gpio,
+	uint gpio_num,
+	uint index_gpio)
+{
+	// 8MHz(プログラムは２サイクル消費しているので、サンプリングは4MHzになる）
+	static const float STATEMACHINE_CLOCK = 15.625;
+
+	pio_sm_config c = pio_fddwrite_program_get_default_config(prog_addr);
+
+	sm_config_set_set_pins(&c, start_gpio, gpio_num);
+	sm_config_set_out_pins(&c, start_gpio, gpio_num);
+	sm_config_set_in_pins(&c, index_gpio);
+
+	for (uint t = 0; t < gpio_num; ++t) {
+		pio_gpio_init( pio, start_gpio + t);
+	}
+	pio_sm_set_consecutive_pindirs(pio, state_machine, start_gpio, gpio_num, true/*OUT*/);
+
+	pio_gpio_init( pio, index_gpio);
+	pio_sm_set_consecutive_pindirs(pio, state_machine, index_gpio, 1, false/*IN*/);
+
+	sm_config_set_out_shift(&c, false, true, 16);		// shift left, auto-pull, threshold
+
+	pio_sm_clear_fifos(pio, state_machine);
+
+    sm_config_set_clkdiv( &c, STATEMACHINE_CLOCK );
+	
+	// Start
+	pio_sm_init(pio, state_machine, prog_addr, &c);
+	pio_sm_set_enabled(pio, state_machine, true);
+}
+
+static inline void pio_outputtofdc_program_init(
+	PIO pio,
+	uint state_machine,
+	uint prog_addr,
+	uint read_gpio,
+	uint writebase_gpio)		// write-data, write-gateの順
+{
+	// 8MHz(プログラムは２サイクル消費しているので、サンプリングは4MHzになる）
+	static const float STATEMACHINE_CLOCK = 15.625;
+
+	pio_sm_config c = pio_fddwrite_program_get_default_config(prog_addr);
+	sm_config_set_wrap(&c, prog_addr+0, prog_addr+1);	// .wrap_target, wrap
+
+	// Output
+	pio_gpio_init( pio, read_gpio);
+	pio_sm_set_consecutive_pindirs(pio, state_machine, read_gpio, 1, true/*OUT*/);
+	sm_config_set_set_pins(&c, read_gpio, 1);
+	sm_config_set_out_pins(&c, read_gpio, 1);
+	sm_config_set_out_shift(&c, false, true, 16);		// shift left, auto-pull, threshold
+
+	// Input
+	pio_gpio_init( pio, writebase_gpio+0);
+	pio_sm_set_consecutive_pindirs(pio, state_machine, writebase_gpio+0, 1, false/*IN*/);
+	pio_gpio_init( pio, writebase_gpio+1);
+	pio_sm_set_consecutive_pindirs(pio, state_machine, writebase_gpio+1, 1, false/*IN*/);
+	sm_config_set_in_pins(&c, writebase_gpio);
+	sm_config_set_in_shift(&c, false, true, 32);		// shift left, auto-push, threshold
+
+	// Start
+    sm_config_set_clkdiv( &c, STATEMACHINE_CLOCK );
+	pio_sm_clear_fifos(pio, state_machine);
+	pio_sm_init(pio, state_machine, prog_addr, &c);
+	pio_sm_set_enabled(pio, state_machine, true);
+}
+
+static inline void pio_read_write_data_program_init(
+	PIO pio,
+	uint smReadData, uint smWriteGate, uint smWriteData,
+	uint paReadData, uint paWriteGate, uint paWriteData,
+	uint ioReadData, uint ioWriteGate, uint ioWriteData)
+{
+	//
+	static const int BITS = 32;
+	// 8MHz(プログラムは２サイクル消費しているので、サンプリングは4MHzになる）
+	static const float STATEMACHINE_CLOCK = 15.625;
+	// STATE MACHINE MAP(MASK)
+	const uint32_t map = (0x01 << smReadData) | (0x01 << smWriteGate) | (0x01 << smWriteData);
+
+
+	pio_sm_config confReadData	 = pio_fddwrite_program_get_default_config(paReadData);
+	pio_sm_config confWriteGate	 = pio_fddwrite_program_get_default_config(paWriteGate);
+	pio_sm_config confWriteData	 = pio_fddwrite_program_get_default_config(paWriteData);
+
+	// STATE MACINE 1: Output READ DATA
+	pio_gpio_init( pio, ioReadData);
+	pio_sm_set_consecutive_pindirs(pio, smReadData, ioReadData, 1, true/*OUT*/);
+	sm_config_set_set_pins(&confReadData, ioReadData, 1);
+	sm_config_set_out_pins(&confReadData, ioReadData, 1);
+	sm_config_set_out_shift(&confReadData, false, true, BITS);		// shift left, auto-pull, threshold
+
+	// STATE MACINE 2: Input WRITE GATE
+	pio_gpio_init( pio, ioWriteGate);
+	pio_sm_set_consecutive_pindirs(pio, smWriteGate, ioWriteGate, 1, false/*IN*/);
+	sm_config_set_in_pins(&confWriteGate, ioWriteGate);
+	sm_config_set_in_shift(&confWriteGate, false, true, BITS);		// shift left, auto-push, threshold
+
+	// STATE MACINE 3: Input WRITE DATA
+	pio_gpio_init( pio, ioWriteData);
+	pio_sm_set_consecutive_pindirs(pio, smWriteData, ioWriteData, 1, false/*IN*/);
+	sm_config_set_in_pins(&confWriteData, ioWriteData);
+	sm_config_set_in_shift(&confWriteData, false, true, BITS);		// shift left, auto-push, threshold
+
+	// Start
+    sm_config_set_clkdiv( &confReadData, STATEMACHINE_CLOCK );
+    sm_config_set_clkdiv( &confWriteGate, STATEMACHINE_CLOCK );
+    sm_config_set_clkdiv( &confWriteData, STATEMACHINE_CLOCK );
+	pio_sm_clear_fifos(pio, smReadData);
+	pio_sm_clear_fifos(pio, smWriteGate);
+	pio_sm_clear_fifos(pio, smWriteData);
+	pio_sm_init(pio, smReadData,  paReadData,  &confReadData);
+	pio_sm_init(pio, smWriteGate, paWriteGate, &confWriteGate);
+	pio_sm_init(pio, smWriteData, paWriteData, &confWriteData);
+	pio_enable_sm_mask_in_sync(pio, map);
+//	pio_sm_set_enabled(pio, smReadData, true);
+
+	return;
+}
+
+
+
+
+%}
